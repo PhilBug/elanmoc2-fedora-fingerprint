@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            meson ninja-build gcc gcc-c++ git pkgconf-pkg-config \
+            glib2-devel libgusb-devel libusb1-devel systemd-devel cairo-devel \
+            shellcheck
+
+      - name: ShellCheck (all optional checks)
+        run: shellcheck -o all install.sh uninstall.sh doctor.sh
+
+      - name: Syntax check
+        run: bash -n install.sh uninstall.sh doctor.sh
+
+      - name: Build the pinned elanmoc2 driver
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^PINNED_COMMIT="\([0-9a-f]\{40\}\)"$/\1/p' install.sh)"
+          test -n "$pin"
+          git init src
+          git -C src remote add origin https://gitlab.freedesktop.org/depau/libfprint.git
+          GIT_TERMINAL_PROMPT=0 git -C src fetch --depth 1 origin "$pin"
+          git -C src checkout -q --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = "$pin"
+          meson setup builddir src \
+            -Ddrivers=elanmoc2 \
+            -Dintrospection=false \
+            -Ddoc=false \
+            -Dinstalled-tests=false \
+            -Dudev_rules=disabled \
+            -Dudev_hwdb=disabled \
+            --prefix=/usr/local
+          ninja -C builddir
+          grep -aq elanmoc2 builddir/libfprint/libfprint-2.so.2.0.0

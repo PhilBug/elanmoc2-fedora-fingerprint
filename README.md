@@ -12,30 +12,34 @@ driver branch (by Davide Depau), which has native, dedicated support for
 `04f3:0c5e` (`ELANMOC2_DEV_0C5E`), and installs it alongside the stock
 package without overwriting it.
 
+> **Experimental.** The driver is a community fork that is not merged upstream.
+> Keep password login enabled and make sure you can always get back into your
+> account.
+
 ## Tested setup
 
 | Component | Value |
 |-----------|-------|
 | Laptop | HP ProBook 455 G8 (likely works on 440/450 G8 too — same sensor) |
 | Sensor | ELAN `04f3:0c5e` (check with `lsusb \| grep -i elan`) |
-| OS | Fedora 44 Workstation (should work on 41+) |
+| OS | Fedora 44 Workstation (tested) |
 | libfprint (stock) | 1.94.100 |
-| Driver branch | depau/libfprint `elanmoc2` @ `11f0316` |
+| fprintd | 1.94.5 |
+| Driver branch | depau/libfprint `elanmoc2` @ `11f0316d069cc90c154c8cb0e46478388c5e2a74` |
 
-Other distributions have confirmed this sensor working via the same driver
-(Ubuntu 24.04, Manjaro, Arch AUR `libfprint-elanmoc2-git`, Mint, Zorin).
+Fedora 41–43 will most likely work too, but they are untested with this exact
+script. Other distributions have confirmed this sensor working via the same
+driver (Ubuntu 24.04, Manjaro, Arch AUR `libfprint-elanmoc2-git`, Mint, Zorin).
 
-## How it works
+The same driver also lists `04f3:0c00`, `04f3:0c4c`, `04f3:0c7c` and
+`04f3:0c90`. Those IDs are untested here, but the script should work for them.
 
-1. Clones the `elanmoc2` branch of `depau/libfprint` (pinned commit).
-2. Builds a minimal `libfprint` with only the `elanmoc2` driver (meson/ninja).
-3. Installs it to `/usr/local/lib64` — **the Fedora package is not touched**.
-4. Registers the path in `ldconfig` and adds a systemd drop-in so `fprintd`
-   loads the custom library first:
-   `/etc/systemd/system/fprintd.service.d/elanmoc2.conf`
-   → `Environment=LD_LIBRARY_PATH=/usr/local/lib64`
-5. Restarts `fprintd`. Enrollment then works via `fprintd-enroll` and GNOME
-   Settings.
+## Requirements
+
+- Fedora Workstation (or another dnf-based Fedora edition)
+- `sudo` access
+- Network access during installation (packages + git clone)
+- About 1 GB of free disk space for the build
 
 ## Install
 
@@ -45,10 +49,23 @@ cd elanmoc2-fedora-fingerprint
 ./install.sh
 ```
 
-The script asks for the sudo password when installing packages and files.
+The script:
 
-Then enroll a finger (default: right index finger) and press your finger on
-the sensor when prompted:
+1. checks for the sensor (a warning is fine if `lsusb` does not show it yet),
+2. installs the build dependencies with `dnf`,
+3. fetches the pinned commit from `depau/libfprint`,
+4. builds a minimal libfprint with only the `elanmoc2` driver,
+5. installs **only** `libfprint-2.so.*` to `/usr/local/lib64`,
+6. adds a systemd drop-in so only `fprintd` loads that library,
+7. restarts `fprintd` and verifies that the ELAN device appears.
+
+The Fedora `libfprint` package is not modified. Everything can be removed with
+`./uninstall.sh`.
+
+## Enroll and verify
+
+Enroll a finger (default: right index finger). Touch the sensor several times
+when prompted and lift your finger between reads:
 
 ```bash
 fprintd-enroll -f right-index-finger
@@ -60,23 +77,110 @@ Test it:
 fprintd-verify
 ```
 
+List enrolled prints:
+
+```bash
+fprintd-list "$USER"
+```
+
 Screen unlock and `sudo`/polkit authentication use the fingerprint
-automatically if the `with-fingerprint` PAM feature is enabled
-(`authselect current` — enabled by default on Fedora Workstation).
+automatically if the `with-fingerprint` PAM feature is enabled. Check with:
+
+```bash
+authselect current
+```
+
+Fedora Workstation enables it by default. If it is missing:
+
+```bash
+sudo authselect enable-feature with-fingerprint
+```
+
+## How it works
+
+- The custom library lives in `/usr/local/lib64` and is **not** registered
+  globally with `ldconfig`, so other applications keep using the stock
+  libfprint from the RPM.
+- `/etc/systemd/system/fprintd.service.d/90-elanmoc2.conf` sets
+  `LD_LIBRARY_PATH=/usr/local/lib64` for `fprintd` only. This is enough for
+  the daemon (and therefore for PAM/GNOME) to use the new driver.
+- The library filename and ABI match the stock package, so no rebuild of
+  `fprintd` is needed.
+
+## Troubleshooting
+
+Run the built-in diagnostic first:
+
+```bash
+./doctor.sh
+```
+
+It checks the sensor, packages, custom library, drop-in, loaded library,
+device list, PAM and SELinux, and prints recent `fprintd` log lines.
+
+### `fprintd-list` says `No devices available`
+
+```bash
+systemctl cat fprintd            # drop-in present?
+systemctl show fprintd -p Environment --value
+sudo systemctl restart fprintd
+fprintd-list "$USER"
+```
+
+The environment must contain `LD_LIBRARY_PATH=/usr/local/lib64`. If the
+drop-in is missing, rerun `./install.sh`.
+
+### `Failed to open device: Access denied`
+
+Usually SELinux or a stale daemon. Try:
+
+```bash
+sudo restorecon -R /usr/local/lib64/libfprint-2*
+sudo systemctl restart fprintd
+sudo ausearch -m avc -ts recent
+```
+
+### Enrollment fails or verification never matches
+
+Remove the old print and enroll again:
+
+```bash
+fprintd-delete "$USER" -f right-index-finger
+fprintd-enroll -f right-index-finger
+```
+
+If fingerprints were previously enrolled **under Windows**, the sensor may
+contain foreign templates. Wipe the on-sensor storage once:
+
+```bash
+sudo ~/elanmoc2-build/libfprint/builddir/examples/clear-storage
+```
+
+> Warning: this erases every template stored in the sensor, including the ones
+> used by Windows.
+
+### After a Fedora upgrade
+
+If `fprintd` or `libfprint` changes ABI, rebuild and reinstall:
+
+```bash
+./install.sh
+```
+
+The script always fetches the same pinned commit, so a rebuild is
+reproducible.
 
 ## Known limitations
 
-- **GDM login screen** (login after boot/reboot) usually does *not* offer
-  fingerprint authentication — a known Linux limitation, unrelated to this
-  driver. Screen unlock works.
-- If fingerprints were previously enrolled **under Windows**, the sensor
-  contains foreign templates. The driver skips/wipes them during enrollment;
-  if enrollment misbehaves, wipe the on-sensor storage once:
-  ```bash
-  ~/elanmoc2-build/libfprint/builddir/examples/clear-storage
-  ```
-  Warning: this erases every template stored *in the sensor*, including ones
-  used by Windows.
+- **GDM login screen** (after boot/reboot) may not offer fingerprint
+  authentication. Depending on the GDM/PAM version it can work, but it is not
+  guaranteed. Screen unlock generally works.
+- Fingerprint authentication is a convenience, not a replacement for the
+  password. Keep password login enabled.
+- The sensor is match-on-chip: fingerprints are matched on the device itself,
+  and no fingerprint images leave the sensor.
+- This is not an official Fedora or libfprint package, and the driver is not
+  merged upstream.
 
 ## Uninstall
 
@@ -84,16 +188,10 @@ automatically if the `with-fingerprint` PAM feature is enabled
 ./uninstall.sh
 ```
 
-Restores the stock state: removes `/usr/local/lib64/libfprint-2*`, the
-ldconfig entry and the systemd drop-in.
-
-## Notes
-
-- After major Fedora upgrades that change `fprintd`/`libfprint` ABI, rebuild:
-  `cd ~/elanmoc2-build/libfprint && git pull && ninja -C builddir`, then rerun
-  the install section of `install.sh`.
-- The sensor is match-on-chip: fingerprints are matched on the device itself,
-  no fingerprint images ever leave the sensor.
+This removes the custom library, the systemd drop-in and any files left by
+older versions of the script (headers, pkg-config file, metainfo, global
+`ldconfig` entry). The stock Fedora package becomes active again. Enrolled
+templates stay in the sensor and become usable again if you reinstall.
 
 ## Credits
 
